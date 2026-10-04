@@ -28,12 +28,21 @@ HELP = """Отправьте текст, чтобы добавить задач�
 /add Купить продукты — быстро добавить задачу без описания
 /list — невыполненные задачи
 /list_all — все задачи
+/search <текст> — поиск по части названия или описания
+/edit <id> — изменить название и описание
+/group_create — создать группу
+/groups — мои группы и количество активных задач
+/group_tasks <group_id> — все задачи группы
+/group_rename <group_id> — переименовать группу
+/group_delete <group_id> — удалить группу, сохранив задачи
+/task_group <id> — выбрать или изменить группу задачи
+/task_ungroup <id> — убрать задачу из группы
 /priority <id> высокий — изменить приоритет (высокий, средний, низкий)
 /done <id> — выполнить задачу и отменить напоминание
 /delete <id> — удалить задачу
 /remind <id> 15.10 18:30 — установить или заменить напоминание
 /remind_off <id> — отменить напоминание
-/cancel — отменить пошаговое создание
+/cancel — отменить текущий диалог
 /help — помощь
 
 В примерах замените <id> на ID своей задачи, а дату — на будущую.
@@ -53,6 +62,9 @@ class TaskDraft:
     title: str = ""
     description: str = ""
     priority: int = 1
+    mode: str = "add"
+    target_id: int | None = None
+    group_id: int | None = None
 
 
 def validate_task_text(title: str, description: str = "") -> None:
@@ -61,6 +73,13 @@ def validate_task_text(title: str, description: str = "") -> None:
     # Общий лимит оставляет место для служебных строк в сообщениях Telegram.
     if len((title + description).encode("utf-16-le")) // 2 > 3000:
         raise InputError("Сократите название и описание: вместе не более 3000 символов (эмодзи могут занимать два).")
+
+
+def validate_group_name(name: str) -> str:
+    name = name.strip()
+    if not name or "\n" in name or "\r" in name or len(name.encode("utf-16-le")) // 2 > 80:
+        raise InputError("Введите название группы: одна непустая строка, не более 80 символов.")
+    return name
 
 
 @dataclass(frozen=True)
@@ -117,13 +136,30 @@ def configure_logging() -> None:
 class TaskStore:
     """Небольшое хранилище. Каждый пользовательский запрос проверяет владельца."""
 
+    TASK_SELECT = (
+        "SELECT t.*, g.name AS group_name FROM tasks AS t "
+        "LEFT JOIN task_groups AS g ON g.id = t.group_id AND g.user_id = t.user_id "
+    )
+
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(path, timeout=5)
         self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        # SQLite LOWER/LIKE не обеспечивают полный поиск по кириллице. Casefold
+        # применяется в SQL к обоим полям, а запрос передаётся как обычный параметр.
+        self.connection.create_function("CASEFOLD", 1, str.casefold, deterministic=True)
         try:
             with self.connection:
                 self.connection.executescript("""
+                    CREATE TABLE IF NOT EXISTS task_groups (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        name_key TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        UNIQUE(user_id, name_key)
+                    );
                     CREATE TABLE IF NOT EXISTS tasks (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         user_id INTEGER NOT NULL,
@@ -137,17 +173,22 @@ class TaskStore:
                         reminder_state TEXT NOT NULL DEFAULT 'none'
                             CHECK(reminder_state IN ('none', 'pending', 'sent', 'failed')),
                         next_attempt_at REAL,
-                        sent_at REAL
+                        sent_at REAL,
+                        group_id INTEGER REFERENCES task_groups(id) ON DELETE SET NULL
                     );
                     CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(user_id);
                     CREATE INDEX IF NOT EXISTS tasks_reminders
                         ON tasks(reminder_state, next_attempt_at);
                 """)
-                # CREATE TABLE не меняет существующую схему. Миграция добавляет
-                # только описание, сохраняя старые ID, статусы и напоминания.
+                # Миграция добавляет поля без пересоздания старой таблицы.
                 columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(tasks)")}
                 if "description" not in columns:
                     self.connection.execute("ALTER TABLE tasks ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+                if "group_id" not in columns:
+                    self.connection.execute(
+                        "ALTER TABLE tasks ADD COLUMN group_id INTEGER REFERENCES task_groups(id) ON DELETE SET NULL"
+                    )
+                self.connection.execute("CREATE INDEX IF NOT EXISTS tasks_group ON tasks(user_id, group_id)")
         except sqlite3.Error:
             self.close()
             raise
@@ -157,7 +198,7 @@ class TaskStore:
 
     def get(self, task_id: int, user_id: int) -> sqlite3.Row:
         row = self.connection.execute(
-            "SELECT * FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id)
+            self.TASK_SELECT + "WHERE t.id = ? AND t.user_id = ?", (task_id, user_id)
         ).fetchone()
         if row is None:
             raise InputError("Задача не найдена. Посмотрите ID своих задач: /list_all.")
@@ -166,24 +207,111 @@ class TaskStore:
     def add(
         self, user_id: int, chat_id: int, text: str, description: str = "",
         priority: int = 1, remind_at: float | None = None,
+        group_id: int | None = None,
     ) -> sqlite3.Row:
         text = text.strip()
         description = description.strip()
         validate_task_text(text, description)
+        if group_id is not None:
+            self.get_group(group_id, user_id)
         with self.connection:
             cursor = self.connection.execute(
                 "INSERT INTO tasks(user_id, chat_id, text, description, priority, created_at, "
-                "remind_at, reminder_state, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "remind_at, reminder_state, next_attempt_at, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (user_id, chat_id, text, description, priority, datetime.now(UTC).timestamp(),
-                 remind_at, "pending" if remind_at is not None else "none", remind_at),
+                 remind_at, "pending" if remind_at is not None else "none", remind_at, group_id),
             )
         return self.get(cursor.lastrowid, user_id)
 
-    def list_tasks(self, user_id: int, include_done: bool = False) -> list[sqlite3.Row]:
+    def list_tasks(
+        self, user_id: int, include_done: bool = False, group_id: int | None = None,
+    ) -> list[sqlite3.Row]:
+        if group_id is not None:
+            self.get_group(group_id, user_id)
         return self.connection.execute(
-            "SELECT * FROM tasks WHERE user_id = ? AND (? OR done = 0) "
-            "ORDER BY priority, created_at, id", (user_id, include_done)
+            self.TASK_SELECT + "WHERE t.user_id = ? AND (? OR t.done = 0) "
+            "AND (? IS NULL OR t.group_id = ?) ORDER BY t.priority, t.created_at, t.id",
+            (user_id, include_done, group_id, group_id),
         ).fetchall()
+
+    def search(self, user_id: int, query: str) -> list[sqlite3.Row]:
+        query = query.strip().casefold()
+        if not query:
+            raise InputError("Введите часть названия или описания: /search продук.")
+        return self.connection.execute(
+            self.TASK_SELECT + "WHERE t.user_id = ? "
+            "AND (instr(CASEFOLD(t.text), ?) > 0 OR instr(CASEFOLD(t.description), ?) > 0) "
+            "ORDER BY t.priority, t.created_at, t.id", (user_id, query, query),
+        ).fetchall()
+
+    def update_text(self, task_id: int, user_id: int, title: str, description: str) -> None:
+        self.get(task_id, user_id)
+        title, description = title.strip(), description.strip()
+        validate_task_text(title, description)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE tasks SET text = ?, description = ? WHERE id = ? AND user_id = ?",
+                (title, description, task_id, user_id),
+            )
+
+    def get_group(self, group_id: int, user_id: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM task_groups WHERE id = ? AND user_id = ?", (group_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise InputError("Группа не найдена. ID своих групп: /groups.")
+        return row
+
+    def list_groups(self, user_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT g.*, COUNT(t.id) AS total_count, "
+            "COUNT(CASE WHEN t.done = 0 THEN 1 END) AS active_count "
+            "FROM task_groups AS g LEFT JOIN tasks AS t "
+            "ON t.group_id = g.id AND t.user_id = g.user_id "
+            "WHERE g.user_id = ? GROUP BY g.id ORDER BY g.created_at, g.id", (user_id,),
+        ).fetchall()
+
+    def create_group(self, user_id: int, name: str) -> sqlite3.Row:
+        name = validate_group_name(name)
+        try:
+            with self.connection:
+                cursor = self.connection.execute(
+                    "INSERT INTO task_groups(user_id, name, name_key, created_at) VALUES (?, ?, ?, ?)",
+                    (user_id, name, name.casefold(), datetime.now(UTC).timestamp()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise InputError("Группа с таким названием уже существует. Выберите другое название.") from exc
+        return self.get_group(cursor.lastrowid, user_id)
+
+    def rename_group(self, group_id: int, user_id: int, name: str) -> None:
+        self.get_group(group_id, user_id)
+        name = validate_group_name(name)
+        try:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE task_groups SET name = ?, name_key = ? WHERE id = ? AND user_id = ?",
+                    (name, name.casefold(), group_id, user_id),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise InputError("Группа с таким названием уже существует. Выберите другое название.") from exc
+
+    def delete_group(self, group_id: int, user_id: int) -> None:
+        self.get_group(group_id, user_id)
+        # Одна транзакция: задачи и их напоминания остаются, удаляется лишь связь.
+        with self.connection:
+            self.connection.execute(
+                "UPDATE tasks SET group_id = NULL WHERE group_id = ? AND user_id = ?", (group_id, user_id),
+            )
+            self.connection.execute("DELETE FROM task_groups WHERE id = ? AND user_id = ?", (group_id, user_id))
+
+    def assign_group(self, task_id: int, user_id: int, group_id: int | None) -> None:
+        self.get(task_id, user_id)
+        if group_id is not None:
+            self.get_group(group_id, user_id)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE tasks SET group_id = ? WHERE id = ? AND user_id = ?", (group_id, task_id, user_id),
+            )
 
     def set_priority(self, task_id: int, user_id: int, priority: int) -> None:
         self.get(task_id, user_id)
@@ -222,8 +350,8 @@ class TaskStore:
 
     def due(self, now: float) -> list[sqlite3.Row]:
         return self.connection.execute(
-            "SELECT * FROM tasks WHERE done = 0 AND reminder_state = 'pending' "
-            "AND remind_at <= ? AND next_attempt_at <= ? ORDER BY remind_at, id LIMIT 100",
+            self.TASK_SELECT + "WHERE t.done = 0 AND t.reminder_state = 'pending' "
+            "AND t.remind_at <= ? AND t.next_attempt_at <= ? ORDER BY t.remind_at, t.id LIMIT 100",
             (now, now),
         ).fetchall()
 
@@ -297,11 +425,14 @@ class TaskAssistant:
     def format_time(self, timestamp: float) -> str:
         return datetime.fromtimestamp(timestamp, self.tz).strftime("%d.%m.%Y %H:%M") + f" ({self.tz.key})"
 
-    def format_task(self, row: sqlite3.Row) -> str:
+    def format_task(self, row: sqlite3.Row, show_created: bool = False) -> str:
         status = "✅ выполнена" if row["done"] else "⬜ не выполнена"
         text = f"#{row['id']} · {PRIORITY_LABELS[row['priority']]} · {status}\n{row['text']}"
         if row["description"]:
             text += f"\nОписание: {row['description']}"
+        text += f"\nГруппа: {row['group_name'] or 'Без группы'}"
+        if show_created:
+            text += f"\nСоздана: {self.format_time(row['created_at'])}"
         if row["remind_at"] is not None:
             states = {"pending": "ожидает отправки", "sent": "отправлено", "failed": "не доставлено; задайте заново через /remind"}
             text += f"\n⏰ {self.format_time(row['remind_at'])} — {states[row['reminder_state']]}"
@@ -334,8 +465,24 @@ class TaskAssistant:
             if args:
                 raise InputError("Для отмены отправьте /cancel без параметров.")
             if self.drafts.pop((user_id, chat_id), None) is not None:
-                return "Создание задачи отменено. Чтобы начать заново, отправьте /add."
-            return "Нет задачи в процессе создания. Начать: /add."
+                return "Диалог отменён. Незавершённые изменения не сохранены."
+            return "Нет активного диалога. Добавить задачу: /add."
+        if command == "/search":
+            rows = self.store.search(user_id, body)
+            if not rows:
+                return "Задачи не найдены. Попробуйте другую часть названия или описания."
+            return "Найденные задачи:\n\n" + "\n\n".join(self.format_task(row, show_created=True) for row in rows)
+        if command == "/edit":
+            if len(args) != 1:
+                raise InputError("Формат: /edit <id>.")
+            task_id = parse_id(args[0])
+            row = self.store.get(task_id, user_id)
+            self.drafts[(user_id, chat_id)] = TaskDraft(
+                mode="edit", target_id=task_id, step="edit_title", title=row["text"], description=row["description"],
+            )
+            return f"Текущее название: {row['text']}\nВведите новое название или нажмите «Оставить»."
+        if command in ("/group_create", "/groups", "/group_tasks", "/group_rename", "/group_delete", "/task_group", "/task_ungroup"):
+            return self.group_command(command, args, user_id, chat_id)
         if command in ("/list", "/list_all"):
             if args:
                 raise InputError("Используйте /list для активных задач или /list_all для всех задач.")
@@ -374,8 +521,87 @@ class TaskAssistant:
             return f"⏰ Напоминание для задачи #{task_id}: {self.format_time(when)}."
         return "Неизвестная команда. Посмотрите примеры: /help."
 
+    def group_command(self, command: str, args: list[str], user_id: int, chat_id: int) -> str:
+        if command in ("/group_create", "/groups"):
+            if args:
+                raise InputError(f"Отправьте {command} без параметров.")
+            if command == "/group_create":
+                self.drafts[(user_id, chat_id)] = TaskDraft(mode="group_create", step="group_name")
+                return "Введите название группы"
+            rows = self.store.list_groups(user_id)
+            if not rows:
+                return "Групп пока нет. Создать группу: /group_create."
+            return "Ваши группы:\n" + "\n".join(
+                f"#{row['id']} · {row['name']} — активных задач: {row['active_count']}" for row in rows
+            )
+        if len(args) != 1:
+            placeholder = "<id>" if command.startswith("/task_") else "<group_id>"
+            raise InputError(f"Формат: {command} {placeholder}.")
+        entity_id = parse_id(args[0])
+        if command.startswith("/task_"):
+            self.store.get(entity_id, user_id)
+            if command == "/task_ungroup":
+                self.store.assign_group(entity_id, user_id, None)
+                return f"Задача #{entity_id} теперь без группы."
+            if not self.store.list_groups(user_id):
+                return "Групп пока нет. Сначала создайте группу: /group_create."
+            self.drafts[(user_id, chat_id)] = TaskDraft(mode="assign_group", target_id=entity_id, step="select_group")
+            return "Выберите группу кнопкой или введите её ID. Отмена: /cancel."
+        row = self.store.get_group(entity_id, user_id)
+        if command == "/group_tasks":
+            tasks = self.store.list_tasks(user_id, include_done=True, group_id=entity_id)
+            if not tasks:
+                return f"В группе «{row['name']}» пока нет задач. Добавить задачу в неё: /task_group <id>."
+            return f"Задачи группы «{row['name']}»:\n\n" + "\n\n".join(self.format_task(task) for task in tasks)
+        if command == "/group_rename":
+            self.drafts[(user_id, chat_id)] = TaskDraft(mode="group_rename", target_id=entity_id, step="group_name")
+            return f"Текущее название группы: {row['name']}\nВведите новое название группы"
+        self.store.delete_group(entity_id, user_id)
+        return f"Группа «{row['name']}» удалена. Её задачи сохранены без группы, напоминания не изменены."
+
+    def resolve_group_choice(self, text: str, user_id: int) -> sqlite3.Row:
+        # Кнопка содержит ID, чтобы названия «Пропустить» и одинаковые имена
+        # разных пользователей не путали выбор. Владельца проверяем заново.
+        match = re.fullmatch(r"#([0-9]+) · .+", text)
+        group_id = parse_id(match.group(1) if match else text)
+        return self.store.get_group(group_id, user_id)
+
+    def reminder_prompt(self) -> str:
+        year = datetime.now(self.tz).year
+        return (
+            "Установить напоминание\nВведите дату и время в формате ДД.ММ ЧЧ:ММ, "
+            f"например 15.10 18:30. Год: {year}, часовой пояс: {self.tz.key}.\n"
+            "Дата должна быть в будущем. Если напоминание не нужно, нажмите «Пропустить»."
+        )
+
     def advance_draft(self, text: str, user_id: int, chat_id: int) -> str:
         draft = self.drafts[(user_id, chat_id)]
+        if draft.mode in ("group_create", "group_rename"):
+            if draft.mode == "group_create":
+                row = self.store.create_group(user_id, text)
+                response = f"Группа создана: #{row['id']} · {row['name']}. Добавить задачу: /task_group <id>."
+            else:
+                self.store.rename_group(draft.target_id, user_id, text)
+                response = f"Группа #{draft.target_id} переименована в «{text.strip()}»."
+            self.drafts.pop((user_id, chat_id))
+            return response
+        if draft.mode == "assign_group":
+            group = self.resolve_group_choice(text, user_id)
+            self.store.assign_group(draft.target_id, user_id, group["id"])
+            self.drafts.pop((user_id, chat_id))
+            return f"Задача #{draft.target_id} в группе «{group['name']}»."
+        if draft.mode == "edit":
+            if draft.step == "edit_title":
+                title = draft.title if text.casefold() == "оставить" else text
+                validate_task_text(title)
+                draft.title, draft.step = title, "edit_description"
+                current = draft.description or "(без описания)"
+                return f"Текущее описание: {current}\nВведите новое описание, нажмите «Оставить» или «Очистить»."
+            description = draft.description if text.casefold() == "оставить" else "" if text.casefold() == "очистить" else text
+            self.store.update_text(draft.target_id, user_id, draft.title, description)
+            row = self.store.get(draft.target_id, user_id)
+            self.drafts.pop((user_id, chat_id))
+            return "Задача обновлена!\n" + self.format_task(row)
         if draft.step == "title":
             validate_task_text(text)
             draft.title, draft.step = text, "description"
@@ -388,20 +614,41 @@ class TaskAssistant:
         if draft.step == "priority":
             if text.lower() not in PRIORITIES:
                 raise InputError("Укажите приоритет (высокий, средний, низкий) — выберите кнопку или введите вариант текстом.")
-            draft.priority, draft.step = PRIORITIES[text.lower()], "reminder"
-            year = datetime.now(self.tz).year
-            return (
-                "Установить напоминание\nВведите дату и время в формате ДД.ММ ЧЧ:ММ, "
-                f"например 15.10 18:30. Год: {year}, часовой пояс: {self.tz.key}.\n"
-                "Дата должна быть в будущем. Если напоминание не нужно, нажмите «Пропустить»."
-            )
+            # Сначала читаем базу: при ошибке выбранный шаг остаётся доступен.
+            groups = self.store.list_groups(user_id)
+            draft.priority = PRIORITIES[text.lower()]
+            draft.step = "add_group" if groups else "reminder"
+            if groups:
+                return "Выберите группу для задачи или нажмите «Пропустить». Можно ввести ID группы."
+            return self.reminder_prompt()
+        if draft.step == "add_group":
+            group_id = None if text.casefold() == "пропустить" else self.resolve_group_choice(text, user_id)["id"]
+            draft.group_id, draft.step = group_id, "reminder"
+            return self.reminder_prompt()
         when = None if text.lower() == "пропустить" else parse_reminder(text, self.tz)
+        if draft.group_id is not None:
+            try:
+                self.store.get_group(draft.group_id, user_id)
+            except InputError as exc:
+                draft.group_id, draft.step = None, "add_group"
+                raise InputError("Выбранная группа удалена. Выберите другую группу или нажмите «Пропустить».") from exc
         # Единственная запись в базу происходит в конце. Если SQLite выдаст ошибку,
         # черновик останется на последнем шаге для повторной попытки.
-        return self.add_response(user_id, chat_id, draft.title, draft.description, draft.priority, when)
+        return self.add_response(user_id, chat_id, draft.title, draft.description, draft.priority, when, draft.group_id)
 
     def keyboard(self, user_id: int, chat_id: int) -> ReplyKeyboardMarkup | ReplyKeyboardRemove:
         draft = self.drafts.get((user_id, chat_id))
+        if draft and draft.step == "edit_title":
+            return ReplyKeyboardMarkup([["Оставить"]], resize_keyboard=True)
+        if draft and draft.step == "edit_description":
+            return ReplyKeyboardMarkup([["Оставить", "Очистить"]], resize_keyboard=True)
+        if draft and draft.step in ("select_group", "add_group"):
+            groups = self.store.list_groups(user_id)
+            # До 50 кнопок; остальные группы доступны через /groups и ввод ID.
+            keys = [[f"#{row['id']} · {row['name']}"] for row in groups[:50]]
+            if draft.step == "add_group":
+                keys.append(["Пропустить"])
+            return ReplyKeyboardMarkup(keys, resize_keyboard=True) if keys else ReplyKeyboardRemove()
         if draft and draft.step == "priority":
             return ReplyKeyboardMarkup([["высокий", "средний", "низкий"]], resize_keyboard=True)
         if draft and draft.step in ("description", "reminder"):
@@ -411,8 +658,9 @@ class TaskAssistant:
     def add_response(
         self, user_id: int, chat_id: int, text: str, description: str = "",
         priority: int = 1, remind_at: float | None = None,
+        group_id: int | None = None,
     ) -> str:
-        row = self.store.add(user_id, chat_id, text, description, priority, remind_at)
+        row = self.store.add(user_id, chat_id, text, description, priority, remind_at, group_id)
         self.drafts.pop((user_id, chat_id), None)
         return (
             "Задача добавлена!\n" + self.format_task(row)
@@ -443,8 +691,14 @@ class TaskAssistant:
         except sqlite3.Error:
             LOGGER.exception("Ошибка SQLite при обработке команды")
             response = "Не удалось прочитать или сохранить данные. Попробуйте позже; проверьте результат через /list_all."
+        try:
+            markup = self.keyboard(user.id, chat.id)
+        except sqlite3.Error:
+            # Даже если база недоступна для построения клавиатуры, отправляем ошибку.
+            LOGGER.exception("Не удалось прочитать группы для клавиатуры")
+            markup = ReplyKeyboardRemove()
         for chunk in split_message(response):
-            await message.reply_text(chunk, reply_markup=self.keyboard(user.id, chat.id))
+            await message.reply_text(chunk, reply_markup=markup)
 
     async def send_due(self, telegram_bot) -> None:
         async with self.lock:
@@ -456,6 +710,7 @@ class TaskAssistant:
                 text = (
                     f"{title}: задача #{row['id']}\n{row['text']}\n"
                     f"{description}"
+                    f"Группа: {row['group_name'] or 'Без группы'}\n"
                     f"{PRIORITY_LABELS[row['priority']]}\n"
                     f"Запланировано: {self.format_time(row['remind_at'])}\n"
                     f"Выполнить: /done {row['id']}"
@@ -493,9 +748,14 @@ async def post_init(application: Application) -> None:
             BotCommand("start", "Начать работу"), BotCommand("help", "Помощь"),
             BotCommand("add", "Добавить задачу"), BotCommand("list", "Список задач"),
             BotCommand("list_all", "Все задачи, включая выполненные"),
+            BotCommand("search", "Поиск по части названия и описания"), BotCommand("edit", "Изменить задачу"),
+            BotCommand("group_create", "Создать группу"), BotCommand("groups", "Мои группы"),
+            BotCommand("group_tasks", "Задачи группы"), BotCommand("group_rename", "Переименовать группу"),
+            BotCommand("group_delete", "Удалить группу, сохранив задачи"),
+            BotCommand("task_group", "Выбрать группу задачи"), BotCommand("task_ungroup", "Убрать задачу из группы"),
             BotCommand("priority", "Изменить приоритет"), BotCommand("done", "Выполнить задачу"),
             BotCommand("delete", "Удалить задачу"), BotCommand("remind", "Настроить напоминание"),
-            BotCommand("remind_off", "Отменить напоминание"), BotCommand("cancel", "Отменить создание задачи"),
+            BotCommand("remind_off", "Отменить напоминание"), BotCommand("cancel", "Отменить текущий диалог"),
         ])
     except TelegramError:
         LOGGER.exception("Не удалось обновить меню команд; обработчики команд доступны")
@@ -520,7 +780,10 @@ def build_application(settings: Settings, store: TaskStore) -> Application:
     application.bot_data["assistant"] = assistant
     # Отдельный фильтр для обычных сообщений исключает повторное создание задач
     # при редактировании уже отправленного текста.
-    commands = ["start", "help", "add", "list", "list_all", "priority", "done", "delete", "remind", "remind_off", "cancel"]
+    commands = [
+        "start", "help", "add", "list", "list_all", "priority", "done", "delete", "remind", "remind_off", "cancel",
+        "search", "edit", "group_create", "groups", "group_tasks", "group_rename", "group_delete", "task_group", "task_ungroup",
+    ]
     application.add_handler(CommandHandler(commands, assistant.handle, filters=filters.UpdateType.MESSAGE))
     application.add_handler(MessageHandler(filters.UpdateType.MESSAGE, assistant.handle))
     application.add_error_handler(on_error)

@@ -459,7 +459,11 @@ class DeliveryCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(jobs), 1)
         self.telegram.set_my_commands.assert_awaited_once()
         menu = {item.command for item in self.telegram.set_my_commands.call_args.args[0]}
-        self.assertTrue({"list_all", "remind_off", "cancel"}.issubset(menu))
+        self.assertTrue({
+            "list_all", "remind_off", "cancel", "search", "edit", "group_create",
+            "groups", "group_tasks", "group_rename", "group_delete", "task_group",
+            "task_ungroup",
+        }.issubset(menu))
         # Удаляем стандартное задание; выполняем его callback реальным планировщиком
         # с подменённым контекстом, чтобы никакой запрос не ушёл в Telegram.
         jobs[0].schedule_removal()
@@ -562,6 +566,40 @@ class DeliveryCase(unittest.IsolatedAsyncioTestCase):
             await deliver("Пропустить")
             self.assertEqual(self.store.get(3, 1)["description"], "Описание через Telegram")
             self.assertEqual(request.markups[-1], {"remove_keyboard": True})
+            await deliver("/group_create")
+            await deliver("Работа")
+            await deliver("/groups")
+            self.assertIn("Работа", request.replies[-1])
+            await deliver("/task_group 3")
+            self.assertIn("keyboard", request.markups[-1])
+            await deliver("#1 · Работа")
+            self.assertEqual(self.store.get(3, 1)["group_id"], 1)
+            await deliver("/edit 3")
+            await deliver("Изменённая задача")
+            await deliver("Новое описание")
+            self.assertEqual(self.store.get(3, 1)["text"], "Изменённая задача")
+            self.assertEqual(self.store.get(3, 1)["description"], "Новое описание")
+            self.assertEqual(request.markups[-1], {"remove_keyboard": True})
+            await deliver("/search МЕНЁН")
+            self.assertIn("Изменённая задача", request.replies[-1])
+            await deliver("/group_tasks 1")
+            self.assertIn("Изменённая задача", request.replies[-1])
+            await deliver("/group_rename 1")
+            await deliver("Учёба")
+            self.assertEqual(self.store.get(3, 1)["group_name"], "Учёба")
+            await deliver("/add")
+            await deliver("Ещё одна задача")
+            await deliver("Пропустить")
+            await deliver("средний")
+            self.assertIn("#1 · Учёба", str(request.markups[-1]))
+            await deliver("#1 · Учёба")
+            await deliver("Пропустить")
+            self.assertEqual(self.store.get(4, 1)["group_id"], 1)
+            await deliver("/task_ungroup 3")
+            self.assertIsNone(self.store.get(3, 1)["group_id"])
+            await deliver("/group_delete 1")
+            self.assertEqual(self.store.list_groups(1), [])
+            self.assertIsNone(self.store.get(4, 1)["group_id"])
 
 
 if __name__ == "__main__":
