@@ -74,6 +74,7 @@ class Lab2Case(unittest.TestCase):
         self.assertEqual(after.pop("description"), "Новое описание")
         before.pop("text")
         before.pop("description")
+        self.assertEqual(after.pop("revision"), before.pop("revision") + 1)
         self.assertEqual(after, before)
         self.assertNotIn((1, 1), self.bot.drafts)
 
@@ -151,6 +152,7 @@ class Lab2Case(unittest.TestCase):
         for key in ("group_id", "group_name"):
             before.pop(key)
             self.assertIsNone(after.pop(key))
+        self.assertEqual(after.pop("revision"), before.pop("revision") + 1)
         self.assertEqual(before, after)
 
     def test_failed_group_delete_rolls_back_task_links(self):
@@ -283,6 +285,9 @@ class Lab2Case(unittest.TestCase):
             row = dict(migrated.get(7, 1))
             self.assertIsNone(row.pop("group_id"))
             self.assertIsNone(row.pop("group_name"))
+            self.assertIsNone(row.pop("deadline_at"))
+            self.assertEqual(row.pop("deadline_has_time"), 1)
+            self.assertEqual(row.pop("revision"), 0)
             self.assertEqual(row, original)
             group = migrated.create_group(1, "Миграция")
             migrated.assign_group(7, 1, group["id"])

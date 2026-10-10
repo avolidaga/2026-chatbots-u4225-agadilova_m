@@ -15,7 +15,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 from telegram import BotCommand, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.error import BadRequest, Forbidden, InvalidToken, RetryAfter, TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+from errors import InputError
+from task_dates import deadline_day
 
 BASE_DIR = Path(__file__).resolve().parent
 LOGGER = logging.getLogger(__name__)
@@ -48,10 +51,6 @@ HELP = """Отправьте текст, чтобы добавить задач�
 В примерах замените <id> на ID своей задачи, а дату — на будущую.
 Формат даты: ДД.ММ ЧЧ:ММ (текущий год), также доступен ДД.ММ.ГГГГ ЧЧ:ММ.
 """
-
-
-class InputError(ValueError):
-    """Ошибка ввода, которую можно безопасно показать пользователю."""
 
 
 @dataclass
@@ -188,6 +187,17 @@ class TaskStore:
                     self.connection.execute(
                         "ALTER TABLE tasks ADD COLUMN group_id INTEGER REFERENCES task_groups(id) ON DELETE SET NULL"
                     )
+                # Новая миграция не меняет прежние сроки доставки или статусы.
+                for name, definition in (
+                    ("deadline_at", "REAL"),
+                    ("deadline_has_time", "INTEGER NOT NULL DEFAULT 1 CHECK(deadline_has_time IN (0, 1))"),
+                    ("revision", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if name not in columns:
+                        self.connection.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
+                group_columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(task_groups)")}
+                if "revision" not in group_columns:
+                    self.connection.execute("ALTER TABLE task_groups ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
                 self.connection.execute("CREATE INDEX IF NOT EXISTS tasks_group ON tasks(user_id, group_id)")
         except sqlite3.Error:
             self.close()
@@ -208,6 +218,7 @@ class TaskStore:
         self, user_id: int, chat_id: int, text: str, description: str = "",
         priority: int = 1, remind_at: float | None = None,
         group_id: int | None = None,
+        deadline_at: float | None = None, deadline_has_time: bool = True,
     ) -> sqlite3.Row:
         text = text.strip()
         description = description.strip()
@@ -217,11 +228,17 @@ class TaskStore:
         with self.connection:
             cursor = self.connection.execute(
                 "INSERT INTO tasks(user_id, chat_id, text, description, priority, created_at, "
-                "remind_at, reminder_state, next_attempt_at, group_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "remind_at, reminder_state, next_attempt_at, group_id, deadline_at, deadline_has_time) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (user_id, chat_id, text, description, priority, datetime.now(UTC).timestamp(),
-                 remind_at, "pending" if remind_at is not None else "none", remind_at, group_id),
+                 remind_at, "pending" if remind_at is not None else "none", remind_at, group_id,
+                 deadline_at, int(deadline_has_time)),
             )
-        return self.get(cursor.lastrowid, user_id)
+            if group_id is not None:
+                self.connection.execute("UPDATE task_groups SET revision = revision + 1 WHERE id = ?", (group_id,))
+            # Читаем результат до commit: сбой чтения тоже откатывает вставку.
+            row = self.get(cursor.lastrowid, user_id)
+        return row
 
     def list_tasks(
         self, user_id: int, include_done: bool = False, group_id: int | None = None,
@@ -250,7 +267,7 @@ class TaskStore:
         validate_task_text(title, description)
         with self.connection:
             self.connection.execute(
-                "UPDATE tasks SET text = ?, description = ? WHERE id = ? AND user_id = ?",
+                "UPDATE tasks SET text = ?, description = ?, revision = revision + 1 WHERE id = ? AND user_id = ?",
                 (title, description, task_id, user_id),
             )
 
@@ -279,9 +296,10 @@ class TaskStore:
                     "INSERT INTO task_groups(user_id, name, name_key, created_at) VALUES (?, ?, ?, ?)",
                     (user_id, name, name.casefold(), datetime.now(UTC).timestamp()),
                 )
+                row = self.get_group(cursor.lastrowid, user_id)
         except sqlite3.IntegrityError as exc:
             raise InputError("Группа с таким названием уже существует. Выберите другое название.") from exc
-        return self.get_group(cursor.lastrowid, user_id)
+        return row
 
     def rename_group(self, group_id: int, user_id: int, name: str) -> None:
         self.get_group(group_id, user_id)
@@ -289,7 +307,7 @@ class TaskStore:
         try:
             with self.connection:
                 self.connection.execute(
-                    "UPDATE task_groups SET name = ?, name_key = ? WHERE id = ? AND user_id = ?",
+                    "UPDATE task_groups SET name = ?, name_key = ?, revision = revision + 1 WHERE id = ? AND user_id = ?",
                     (name, name.casefold(), group_id, user_id),
                 )
         except sqlite3.IntegrityError as exc:
@@ -300,42 +318,50 @@ class TaskStore:
         # Одна транзакция: задачи и их напоминания остаются, удаляется лишь связь.
         with self.connection:
             self.connection.execute(
-                "UPDATE tasks SET group_id = NULL WHERE group_id = ? AND user_id = ?", (group_id, user_id),
+                "UPDATE tasks SET group_id = NULL, revision = revision + 1 WHERE group_id = ? AND user_id = ?", (group_id, user_id),
             )
             self.connection.execute("DELETE FROM task_groups WHERE id = ? AND user_id = ?", (group_id, user_id))
 
     def assign_group(self, task_id: int, user_id: int, group_id: int | None) -> None:
-        self.get(task_id, user_id)
+        row = self.get(task_id, user_id)
         if group_id is not None:
             self.get_group(group_id, user_id)
         with self.connection:
             self.connection.execute(
-                "UPDATE tasks SET group_id = ? WHERE id = ? AND user_id = ?", (group_id, task_id, user_id),
+                "UPDATE tasks SET group_id = ?, revision = revision + 1 WHERE id = ? AND user_id = ?", (group_id, task_id, user_id),
+            )
+            self.connection.execute(
+                "UPDATE task_groups SET revision = revision + 1 WHERE user_id = ? AND (id = ? OR id = ?)",
+                (user_id, row["group_id"], group_id),
             )
 
     def set_priority(self, task_id: int, user_id: int, priority: int) -> None:
         self.get(task_id, user_id)
         with self.connection:
             self.connection.execute(
-                "UPDATE tasks SET priority = ? WHERE id = ? AND user_id = ?",
+                "UPDATE tasks SET priority = ?, revision = revision + 1 WHERE id = ? AND user_id = ?",
                 (priority, task_id, user_id),
             )
 
     def finish(self, task_id: int, user_id: int) -> None:
-        self.get(task_id, user_id)
+        row = self.get(task_id, user_id)
         with self.connection:
             self.connection.execute(
                 "UPDATE tasks SET done = 1, remind_at = NULL, reminder_state = 'none', "
-                "next_attempt_at = NULL, sent_at = NULL WHERE id = ? AND user_id = ?",
+                "next_attempt_at = NULL, sent_at = NULL, revision = revision + 1 WHERE id = ? AND user_id = ?",
                 (task_id, user_id),
             )
+            if row["group_id"] is not None:
+                self.connection.execute("UPDATE task_groups SET revision = revision + 1 WHERE id = ?", (row["group_id"],))
 
     def delete(self, task_id: int, user_id: int) -> None:
-        self.get(task_id, user_id)
+        row = self.get(task_id, user_id)
         with self.connection:
             self.connection.execute(
                 "DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, user_id)
             )
+            if row["group_id"] is not None:
+                self.connection.execute("UPDATE task_groups SET revision = revision + 1 WHERE id = ?", (row["group_id"],))
 
     def set_reminder(self, task_id: int, user_id: int, when: float | None) -> None:
         row = self.get(task_id, user_id)
@@ -344,9 +370,54 @@ class TaskStore:
         with self.connection:
             self.connection.execute(
                 "UPDATE tasks SET remind_at = ?, reminder_state = ?, next_attempt_at = ?, "
-                "sent_at = NULL WHERE id = ? AND user_id = ?",
+                "sent_at = NULL, revision = revision + 1 WHERE id = ? AND user_id = ?",
                 (when, "none" if when is None else "pending", when, task_id, user_id),
             )
+
+    def set_deadline(self, task_id: int, user_id: int, when: float | None, has_time: bool = True) -> None:
+        self.get(task_id, user_id)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE tasks SET deadline_at = ?, deadline_has_time = ?, revision = revision + 1 "
+                "WHERE id = ? AND user_id = ?", (when, int(has_time), task_id, user_id),
+            )
+
+    def filtered_tasks(self, user_id: int, view: str, tz: ZoneInfo,
+                       group_id: int | None = None, query: str | None = None,
+                       now: datetime | None = None) -> list[sqlite3.Row]:
+        """Готовые представления; UTC-сроки сравниваются с местным календарём."""
+        if group_id is not None:
+            self.get_group(group_id, user_id)
+        rows = self.search(user_id, query) if query is not None else self.list_tasks(user_id, True, group_id)
+        now = now or datetime.now(UTC)
+        today = now.astimezone(tz).date()
+        if view not in {"active", "done", "all", "high", "reminders", "today", "overdue"}:
+            raise InputError("Неизвестный фильтр.")
+        result = []
+        for row in rows:
+            if group_id is not None and row["group_id"] != group_id:
+                continue
+            if view == "done":
+                keep = bool(row["done"])
+            elif view == "all":
+                keep = True
+            elif row["done"]:
+                keep = False
+            elif view == "active":
+                keep = True
+            elif view == "high":
+                keep = row["priority"] == 0
+            elif view == "reminders":
+                keep = row["reminder_state"] == "pending"
+            elif view == "today":
+                keep = row["deadline_at"] is not None and deadline_day(
+                    row["deadline_at"], bool(row["deadline_has_time"]), tz,
+                ) == today
+            else:
+                keep = row["deadline_at"] is not None and row["deadline_at"] <= now.timestamp()
+            if keep:
+                result.append(row)
+        return result
 
     def due(self, now: float) -> list[sqlite3.Row]:
         return self.connection.execute(
@@ -413,6 +484,14 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
 
 
 class TaskAssistant:
+    # Эти правила используются и командным сервисом, и кнопочным интерфейсом.
+    parse_id = staticmethod(parse_id)
+    parse_reminder = staticmethod(parse_reminder)
+    validate_text = staticmethod(validate_task_text)
+    validate_group_name = staticmethod(validate_group_name)
+    priorities = PRIORITIES
+    priority_labels = PRIORITY_LABELS
+
     def __init__(self, store: TaskStore, tz: ZoneInfo):
         self.store = store
         self.tz = tz
@@ -431,6 +510,15 @@ class TaskAssistant:
         if row["description"]:
             text += f"\nОписание: {row['description']}"
         text += f"\nГруппа: {row['group_name'] or 'Без группы'}"
+        if row["deadline_at"] is not None:
+            when = row["deadline_at"]
+            label = self.format_time(when) if row["deadline_has_time"] else (
+                deadline_day(when, False, self.tz).strftime("%d.%m.%Y") + f" — до конца дня ({self.tz.key})"
+            )
+            overdue = not row["done"] and when <= datetime.now(UTC).timestamp()
+            text += f"\n📅 Срок: {label}" + (" · ПРОСРОЧЕНА" if overdue else "")
+        else:
+            text += "\n📅 Срок: не задан"
         if show_created:
             text += f"\nСоздана: {self.format_time(row['created_at'])}"
         if row["remind_at"] is not None:
@@ -716,7 +804,8 @@ class TaskAssistant:
                     f"Выполнить: /done {row['id']}"
                 )
                 try:
-                    await telegram_bot.send_message(chat_id=row["chat_id"], text=text)
+                    await telegram_bot.send_message(chat_id=row["chat_id"], text=text,
+                                                    reply_markup=self.reminder_markup(row))
                 except RetryAfter as exc:
                     delay = exc.retry_after
                     seconds = delay.total_seconds() if isinstance(delay, timedelta) else delay
@@ -733,6 +822,10 @@ class TaskAssistant:
                     # Отмечаем отправленным только после подтверждения Telegram.
                     self.store.delivery_result(row, "sent")
 
+    def reminder_markup(self, row):
+        """Telegram-адаптер новой версии подставляет кнопки; сервис не знает их устройства."""
+        return None
+
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     await context.application.bot_data["assistant"].send_due(context.bot)
@@ -745,7 +838,7 @@ async def post_init(application: Application) -> None:
     )
     try:
         await application.bot.set_my_commands([
-            BotCommand("start", "Начать работу"), BotCommand("help", "Помощь"),
+            BotCommand("start", "Начать работу"), BotCommand("menu", "Главное меню"), BotCommand("help", "Помощь"),
             BotCommand("add", "Добавить задачу"), BotCommand("list", "Список задач"),
             BotCommand("list_all", "Все задачи, включая выполненные"),
             BotCommand("search", "Поиск по части названия и описания"), BotCommand("edit", "Изменить задачу"),
@@ -775,16 +868,19 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def build_application(settings: Settings, store: TaskStore) -> Application:
-    assistant = TaskAssistant(store, settings.timezone)
+    # Импорт не создаёт соединений, не читает .env и не меняет базу.
+    from buttons import ButtonAssistant
+    assistant = ButtonAssistant(TaskAssistant(store, settings.timezone))
     application = Application.builder().token(settings.token).post_init(post_init).build()
     application.bot_data["assistant"] = assistant
     # Отдельный фильтр для обычных сообщений исключает повторное создание задач
     # при редактировании уже отправленного текста.
     commands = [
-        "start", "help", "add", "list", "list_all", "priority", "done", "delete", "remind", "remind_off", "cancel",
+        "start", "menu", "help", "add", "list", "list_all", "priority", "done", "delete", "remind", "remind_off", "cancel",
         "search", "edit", "group_create", "groups", "group_tasks", "group_rename", "group_delete", "task_group", "task_ungroup",
     ]
     application.add_handler(CommandHandler(commands, assistant.handle, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CallbackQueryHandler(assistant.handle_callback))
     application.add_handler(MessageHandler(filters.UpdateType.MESSAGE, assistant.handle))
     application.add_error_handler(on_error)
     return application
@@ -797,7 +893,7 @@ def main() -> int:
         settings = Settings.load()
         store = TaskStore(settings.database)
         application = build_application(settings, store)
-        application.run_polling(allowed_updates=["message"], drop_pending_updates=False)
+        application.run_polling(allowed_updates=["message", "callback_query"], drop_pending_updates=False)
     except InputError as exc:
         LOGGER.error("%s", exc)
         return 1

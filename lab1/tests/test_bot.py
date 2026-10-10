@@ -504,7 +504,9 @@ class DeliveryCase(unittest.IsolatedAsyncioTestCase):
             async def do_request(self, url, method, request_data=None, **kwargs):
                 if url.endswith("/getMe"):
                     result = {"id": 123456, "is_bot": True, "first_name": "Test", "username": "test_bot"}
-                elif url.endswith("/sendMessage"):
+                elif url.endswith("/answerCallbackQuery"):
+                    return 200, json.dumps({"ok": True, "result": True}).encode()
+                elif url.endswith("/sendMessage") or url.endswith("/editMessageText"):
                     params = request_data.parameters
                     self.replies.append(params["text"])
                     self.markups.append(params.get("reply_markup"))
@@ -533,8 +535,19 @@ class DeliveryCase(unittest.IsolatedAsyncioTestCase):
             update = Update.de_json({"update_id": 1, "edited_message" if edited else "message": message}, app.bot)
             await app.process_update(update)
 
+        async def click(label):
+            keys = request.markups[-1]["inline_keyboard"]
+            data = next(button["callback_data"] for row in keys for button in row if label in button["text"])
+            query = {"id": "test-callback", "from": {"id": 1, "is_bot": False, "first_name": "User"},
+                     "chat_instance": "test", "data": data,
+                     "message": {"message_id": 10, "date": 1, "from": {"id": 123456, "is_bot": True, "first_name": "Test"},
+                                 "chat": {"id": 1, "type": "private"}, "text": request.replies[-1]}}
+            await app.process_update(Update.de_json({"update_id": 2, "callback_query": query}, app.bot))
+
         async with app:
             await deliver("Купить хлеб")
+            self.assertEqual(self.store.list_tasks(1), [])  # Новое согласованное поведение.
+            await deliver("/add Купить хлеб")
             await deliver("/add@ test")  # Неизвестная команда, задача не добавляется.
             await deliver("/add@other_bot Чужому боту")
             await deliver("/add Подготовить отчёт")
@@ -560,44 +573,56 @@ class DeliveryCase(unittest.IsolatedAsyncioTestCase):
             await deliver("/add")
             self.assertEqual(request.replies[-1], "Введите название задачи")
             await deliver("Диалог через Telegram")
-            self.assertIn("keyboard", request.markups[-1])
+            self.assertIn("inline_keyboard", request.markups[-1])
             await deliver("Описание через Telegram")
-            await deliver("высокий")
-            await deliver("Пропустить")
+            await click("высокий")
+            await click("Пропустить")  # Группа.
+            await click("Пропустить")  # Срок.
+            await click("Пропустить")  # Напоминание.
+            self.assertEqual(len(self.store.list_tasks(1, True)), 2)
+            await click("Сохранить")
             self.assertEqual(self.store.get(3, 1)["description"], "Описание через Telegram")
-            self.assertEqual(request.markups[-1], {"remove_keyboard": True})
+            self.assertIn("inline_keyboard", request.markups[-1])
             await deliver("/group_create")
             await deliver("Работа")
+            await click("Сохранить")
             await deliver("/groups")
             self.assertIn("Работа", request.replies[-1])
             await deliver("/task_group 3")
-            self.assertIn("keyboard", request.markups[-1])
-            await deliver("#1 · Работа")
+            self.assertIn("inline_keyboard", request.markups[-1])
+            await click("Работа")
+            await click("Сохранить")
             self.assertEqual(self.store.get(3, 1)["group_id"], 1)
             await deliver("/edit 3")
             await deliver("Изменённая задача")
             await deliver("Новое описание")
+            await click("Сохранить")
             self.assertEqual(self.store.get(3, 1)["text"], "Изменённая задача")
             self.assertEqual(self.store.get(3, 1)["description"], "Новое описание")
-            self.assertEqual(request.markups[-1], {"remove_keyboard": True})
+            self.assertIn("inline_keyboard", request.markups[-1])
             await deliver("/search МЕНЁН")
             self.assertIn("Изменённая задача", request.replies[-1])
             await deliver("/group_tasks 1")
             self.assertIn("Изменённая задача", request.replies[-1])
             await deliver("/group_rename 1")
             await deliver("Учёба")
+            await click("Сохранить")
             self.assertEqual(self.store.get(3, 1)["group_name"], "Учёба")
             await deliver("/add")
             await deliver("Ещё одна задача")
-            await deliver("Пропустить")
-            await deliver("средний")
-            self.assertIn("#1 · Учёба", str(request.markups[-1]))
-            await deliver("#1 · Учёба")
-            await deliver("Пропустить")
+            await click("Пропустить")
+            await click("средний")
+            self.assertIn("Учёба", str(request.markups[-1]))
+            await click("Учёба")
+            await click("Пропустить")
+            await click("Пропустить")
+            await click("Сохранить")
             self.assertEqual(self.store.get(4, 1)["group_id"], 1)
             await deliver("/task_ungroup 3")
             self.assertIsNone(self.store.get(3, 1)["group_id"])
             await deliver("/group_delete 1")
+            self.assertEqual(len(self.store.list_groups(1)), 1)
+            await click("Да, удалить")
             self.assertEqual(self.store.list_groups(1), [])
             self.assertIsNone(self.store.get(4, 1)["group_id"])
 
